@@ -33,7 +33,183 @@ Execution guard
  Max consecutive losses 
 3
  Connect authenticated demo
-Execution locked. Analysis and backtesting are available without credentials.:root{font-family:Inter,system-ui,Arial,sans-serif;background:#090b10;color:#eef1f6}
+Execution locked. Analysis and backtesting are available without credentials.const PUBLIC_WS = "wss://api.derivws.com/trading/v1/options/ws/public";
+
+let ws = null;
+let ticks = [];
+let connected = false;
+let pipSize = 2;
+
+const $ = id => document.getElementById(id);
+
+function digitFromQuote(quote) {
+  const decimals = Math.max(0, Number(pipSize || 2));
+  const s = Number(quote).toFixed(decimals);
+  const parts = s.split(".");
+  const tail = parts[1] || "";
+  return Number(tail.at(-1) || s.at(-1));
+}
+
+function counts(arr) {
+  const c = Array(10).fill(0);
+  for (const d of arr) if (Number.isInteger(d) && d >= 0 && d <= 9) c[d]++;
+  return c;
+}
+
+function normalized(c) {
+  const n = c.reduce((a,b)=>a+b,0);
+  return c.map(x => n ? x/n : 0);
+}
+
+/*
+  This score is a ranking heuristic, not a guaranteed probability.
+  It combines smoothed frequency, recent frequency, and transition behavior.
+*/
+function analyze(arr) {
+  if (!arr.length) return null;
+  const long = arr.slice(-Math.min(1000, arr.length));
+  const short = arr.slice(-Math.min(100, arr.length));
+  const lc = normalized(counts(long));
+  const sc = normalized(counts(short));
+
+  const trans = Array.from({length:10},()=>Array(10).fill(0));
+  for(let i=1;i<long.length;i++) trans[long[i-1]][long[i]]++;
+  const last = arr.at(-1);
+  const row = trans[last];
+  const rowTotal = row.reduce((a,b)=>a+b,0);
+  const tc = row.map(x => rowTotal ? x/rowTotal : 0);
+
+  // Shrink estimates toward uniform to avoid overconfidence.
+  const uniform = 0.1;
+  const score = Array.from({length:10},(_,d) =>
+    0.45*(0.85*lc[d]+0.15*uniform) +
+    0.35*(0.85*sc[d]+0.15*uniform) +
+    0.20*(0.85*tc[d]+0.15*uniform)
+  );
+
+  const top = [...Array(10).keys()].sort((a,b)=>score[b]-score[a]);
+  const best = top[0];
+  const confidence = score[best];
+  return {lc,sc,tc,score,best,confidence,counts:counts(long)};
+}
+
+function render() {
+  const a = analyze(ticks);
+  $("tickCount").textContent = ticks.length.toLocaleString();
+  $("lastDigit").textContent = ticks.at(-1)?.digit ?? "—";
+  if (!a) return;
+
+  const max = Math.max(...a.counts,1);
+  $("digits").innerHTML = a.counts.map((n,d)=>`
+    <div class="digit"><b>${d}</b><span>${(n/a.counts.reduce((x,y)=>x+y,0)*100).toFixed(1)}%</span>
+    <div class="bar"><i style="width:${(n/max)*100}%"></i></div></div>`).join("");
+
+  $("modelScore").textContent = `${(a.confidence*100).toFixed(1)}%`;
+  const threshold = 0.80;
+  const enough = ticks.length >= 200;
+  const signal = enough && a.confidence >= threshold ? "ANALYZE / VERIFY" : "WAIT";
+  $("signal").textContent = signal;
+  $("signal").className = "signal " + (signal === "WAIT" ? "wait" : "trade");
+
+  $("bestMatch").textContent = `${a.best} (${(a.confidence*100).toFixed(1)})`;
+  const differ = [...Array(10).keys()].sort((x,y)=>a.score[x]-a.score[y])[0];
+  $("bestDiffer").textContent = `${differ} (${(a.score[differ]*100).toFixed(1)})`;
+  $("sampleQuality").textContent = enough ? "usable" : `need ${200-ticks.length}`;
+
+  const windows = [50,100,500,1000].filter(n=>ticks.length>=n);
+  $("windows").innerHTML = windows.map(n=>{
+    const sub=ticks.slice(-n).map(x=>x.digit), aa=analyze(sub);
+    return `<tr><td>${n}</td><td>${aa.best}</td><td>${(aa.counts[aa.best]/n*100).toFixed(1)}%</td><td>${(aa.confidence*100).toFixed(1)}%</td><td>${aa.confidence>=threshold?"CHECK":"WAIT"}</td></tr>`;
+  }).join("");
+}
+
+function addTick(quote,time) {
+  const digit = digitFromQuote(quote);
+  ticks.push({quote:Number(quote),time:Number(time),digit});
+  if(ticks.length>10000) ticks=ticks.slice(-10000);
+  const line = `[${new Date(Number(time)*1000).toLocaleTimeString()}] ${quote} → ${digit}`;
+  $("stream").prepend(document.createTextNode(line + "\n"));
+  while($("stream").childNodes.length>80) $("stream").lastChild.remove();
+  render();
+}
+
+function connectPublic() {
+  if(ws) ws.close();
+  ticks=[];
+  $("status").textContent="CONNECTING";
+  ws=new WebSocket(PUBLIC_WS);
+  ws.onopen=()=>{
+    connected=true;
+    $("status").textContent="LIVE";
+    const symbol=$("symbol").value;
+    const count=Number($("historyCount").value);
+    ws.send(JSON.stringify({ticks_history:symbol,end:"latest",count,style:"ticks",subscribe:0,req_id:1}));
+    ws.send(JSON.stringify({ticks:symbol,subscribe:1,req_id:2}));
+  };
+  ws.onmessage=e=>{
+    const d=JSON.parse(e.data);
+    if(d.error){console.error(d.error);$("status").textContent="ERROR";return}
+    if(d.msg_type==="history"){
+      pipSize=Number(d.pip_size ?? 2);
+      const prices=d.history?.prices||[];
+      const times=d.history?.times||[];
+      ticks=prices.map((p,i)=>({quote:Number(p),time:Number(times[i]||Date.now()/1000),digit:digitFromQuote(p)}));
+      render();
+    }
+    if(d.msg_type==="tick") addTick(d.tick.quote,d.tick.epoch);
+  };
+  ws.onclose=()=>{connected=false;$("status").textContent="OFFLINE"};
+  ws.onerror=()=>{$("status").textContent="ERROR"};
+}
+
+function runBacktest() {
+  const min=Number($("btMin").value||200);
+  const threshold=Number($("btThreshold").value||0.8);
+  if(ticks.length<min+10){$("backtestResult").textContent=`Need at least ${min+10} ticks.`;return}
+
+  let predictions=0, correct=0, skipped=0;
+  const outcomes=[];
+  for(let i=min;i<ticks.length-1;i++){
+    const history=ticks.slice(0,i).map(x=>x.digit);
+    const a=analyze(history);
+    if(!a){continue}
+    if(a.confidence>=threshold){
+      predictions++;
+      const actual=ticks[i].digit;
+      const ok=actual===a.best;
+      if(ok) correct++;
+      outcomes.push(ok?1:0);
+    } else skipped++;
+  }
+  const accuracy=predictions?correct/predictions:0;
+  $("backtestResult").textContent =
+`Predictions: ${predictions}
+Correct: ${correct}
+Accuracy: ${(accuracy*100).toFixed(2)}%
+Skipped: ${skipped}
+NOTE: This is historical simulation, not a guarantee of future performance.`;
+}
+
+async function authDemo() {
+  $("executionStatus").textContent="Requesting authenticated demo connection...";
+  try{
+    const r=await fetch("/api/auth-url",{method:"POST"});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.error||"Authentication failed");
+    $("executionStatus").textContent="Authenticated demo URL obtained. This build does not auto-place orders.";
+    console.log("Authenticated demo WebSocket URL received.");
+    // Deliberately do not expose or store the URL in the UI.
+  }catch(e){
+    $("executionStatus").textContent=e.message;
+  }
+}
+
+$("connect").onclick=connectPublic;
+$("stop").onclick=()=>{if(ws)ws.close();};
+$("runBacktest").onclick=runBacktest;
+$("authDemo").onclick=authDemo;
+$("symbol").onchange=()=>{if(connected)connectPublic();};
+:root{font-family:Inter,system-ui,Arial,sans-serif;background:#090b10;color:#eef1f6}
 *{box-sizing:border-box}body{margin:0}.top{display:flex;justify-content:space-between;align-items:center;padding:24px;max-width:1200px;margin:auto}
 h1{font-size:22px;margin:0 0 5px}.top p,.muted{color:#8e98a8}.pill{padding:8px 12px;border-radius:999px;background:#222838;font-size:12px}
 main{max-width:1200px;margin:auto;padding:0 16px 50px}.card{background:#11151d;border:1px solid #252b38;border-radius:14px;padding:18px;margin:14px 0;box-shadow:0 10px 30px rgba(0,0,0,.15)}
@@ -49,63 +225,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px s
 .stream{height:150px;overflow:auto;font-family:monospace;line-height:1.7;color:#b9c1ce}
 .backtest-controls,.guard{display:flex;gap:12px;align-items:end;flex-wrap:wrap}pre{white-space:pre-wrap;background:#0a0d12;border-radius:10px;padding:14px;color:#cbd2dd}
 @media(max-width:800px){.grid,.grid.two{grid-template-columns:1fr 1fr}.digits{grid-template-columns:repeat(5,1fr)}}@media(max-width:500px){.grid,.grid.two{grid-template-columns:1fr}.top{align-items:flex-start;gap:10px}.digits{grid-template-columns:repeat(5,1fr)}}
-{
-  "name": "deriv-digit-analyzer",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Deriv digit analysis, backtesting and guarded demo-execution dashboard.",
-  "type": "module",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
-  },
-  "dependencies": {
-    "express": "^5.1.0",
-    "ws": "^8.18.3"
-  }
-}Deriv Digit Analyzer — V1–V7
-This is a single application containing:
-Live market-data connection
-Multi-window digit analysis
-Frequency / recent-frequency / transition scoring
-WAIT / analysis signal filtering
-Historical walk-forward backtesting
-Risk/execution guard UI
-Authenticated DEMO connection scaffold
-Important
-The model is a statistical ranking system, not a guaranteed predictor. Digit outcomes can behave unpredictably, and a high historical score does not guarantee future accuracy.
-The supplied build intentionally does not place real-money trades. The authenticated route is restricted to a Deriv demo account and only obtains an authenticated WebSocket URL.
-Requirements
-Node.js 20+ recommended
-Internet connection
-Install
-npm install
-npm start
-Open:
-http://localhost:8787
-Live analysis
-No Deriv account token is needed for public tick data. The app connects to the current public WebSocket API and retrieves ticks_history plus the live ticks stream.
-Optional authenticated DEMO connection
-Copy .env.example to .env and fill:
-DERIV_APP_ID=your_app_id
-DERIV_PAT=your_pat
-DERIV_ACCOUNT_ID=your_demo_account_id
-DERIV_ACCOUNT_TYPE=demo
-Then restart:
-npm start
-Keep PAT credentials on the server. Do not put them into public/app.js.
-What to improve before any trading
-Store prediction outcomes in a database.
-Run large out-of-sample tests.
-Separate model-training data from evaluation data.
-Add payout-aware expected-value calculations.
-Add calibration tests (Brier score / reliability curve).
-Add session and daily loss limits.
-Add an explicit demo execution adapter.
-Only consider live execution after extensive demo validation.
-API basis
-The current Deriv documentation provides public ticks and ticks_history WebSocket endpoints for market data. Authenticated trading uses an authenticated WebSocket URL obtained through the OTP flow; buy is an authenticated operation.
-See: https://developers.deriv.com/docs/data/ticks/ https://developers.deriv.com/docs/data/ticks-history/ https://developers.deriv.com/docs/workflows/ https://developers.deriv.com/docs/trading/buy/import express from "express";
+import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 
